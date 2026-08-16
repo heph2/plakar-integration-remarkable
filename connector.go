@@ -1,6 +1,7 @@
 package remarkable
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -20,9 +22,6 @@ import (
 	"github.com/PlakarKorp/kloset/location"
 	"github.com/PlakarKorp/kloset/objects"
 	"github.com/pkg/sftp"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 const defaultRoot = "/home/root"
@@ -43,16 +42,16 @@ var (
 )
 
 type config struct {
-	address              string
-	user                 string
-	password             string
-	privateKey           string
-	privateKeyPassphrase string
-	agentSocket          string
-	knownHosts           string
-	insecureHostKey      bool
-	root                 string
-	targets              []string
+	address         string
+	host            string
+	port            string
+	user            string
+	privateKey      string
+	agentSocket     string
+	knownHosts      string
+	insecureHostKey bool
+	root            string
+	targets         []string
 }
 
 type remoteClient interface {
@@ -63,12 +62,51 @@ type remoteClient interface {
 	Close() error
 }
 
-type sftpRemote struct {
-	*sftp.Client
+type lockedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
 }
 
-func (r *sftpRemote) Open(name string) (io.ReadCloser, error) {
+func (b *lockedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(data)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
+type commandRemote struct {
+	*sftp.Client
+	cmd    *exec.Cmd
+	wait   <-chan error
+	stderr *lockedBuffer
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r *commandRemote) Open(name string) (io.ReadCloser, error) {
 	return r.Client.Open(name)
+}
+
+func (r *commandRemote) Close() error {
+	r.closeOnce.Do(func() {
+		killTimer := time.AfterFunc(2*time.Second, func() {
+			_ = r.cmd.Process.Kill()
+		})
+		clientErr := r.Client.Close()
+		processErr := <-r.wait
+		killTimer.Stop()
+		if processErr != nil {
+			processErr = fmt.Errorf("SSH process: %w: %s", processErr, strings.TrimSpace(r.stderr.String()))
+		}
+		r.closeErr = errors.Join(clientErr, processErr)
+	})
+	return r.closeErr
 }
 
 type Remarkable struct {
@@ -77,10 +115,8 @@ type Remarkable struct {
 	targets []string
 	remote  remoteClient
 
-	sshClient   *ssh.Client
-	agentCloser io.Closer
-	closeOnce   sync.Once
-	closeErr    error
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func init() {
@@ -96,18 +132,16 @@ func NewImporter(ctx context.Context, opts *connectors.Options, proto string, va
 	if err != nil {
 		return nil, err
 	}
-	remote, sshClient, agentCloser, err := connect(ctx, cfg)
+	remote, err := connect(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	imp := &Remarkable{
-		origin:      cfg.address,
-		root:        cfg.root,
-		targets:     cfg.targets,
-		remote:      remote,
-		sshClient:   sshClient,
-		agentCloser: agentCloser,
+		origin:  cfg.address,
+		root:    cfg.root,
+		targets: cfg.targets,
+		remote:  remote,
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -119,8 +153,7 @@ func NewImporter(ctx context.Context, opts *connectors.Options, proto string, va
 }
 
 func parseConfig(values map[string]string) (*config, error) {
-	rawLocation := values["location"]
-	endpoint, err := url.Parse(rawLocation)
+	endpoint, err := url.Parse(values["location"])
 	if err != nil {
 		return nil, fmt.Errorf("parse location: %w", err)
 	}
@@ -129,6 +162,9 @@ func parseConfig(values map[string]string) (*config, error) {
 	}
 	if endpoint.Hostname() == "" {
 		return nil, fmt.Errorf("location is missing a hostname")
+	}
+	if strings.HasPrefix(endpoint.Hostname(), "-") {
+		return nil, fmt.Errorf("location hostname must not begin with '-'")
 	}
 	if endpoint.Path != "" && endpoint.Path != "/" {
 		return nil, fmt.Errorf("location path is fixed; got %q", endpoint.Path)
@@ -140,6 +176,9 @@ func parseConfig(values map[string]string) (*config, error) {
 		if _, set := endpoint.User.Password(); set {
 			return nil, fmt.Errorf("passwords are not allowed in location URIs")
 		}
+	}
+	if values["password"] != "" || values["private_key_passphrase"] != "" {
+		return nil, fmt.Errorf("password authentication is not supported; configure OpenSSH key authentication")
 	}
 
 	username := values["username"]
@@ -153,11 +192,6 @@ func parseConfig(values map[string]string) (*config, error) {
 		username = "root"
 	}
 
-	address := endpoint.Host
-	if endpoint.Port() == "" {
-		address = net.JoinHostPort(endpoint.Hostname(), "22")
-	}
-
 	insecure, err := parseBool(values, "insecure_ignore_host_key")
 	if err != nil {
 		return nil, err
@@ -166,36 +200,22 @@ func parseConfig(values map[string]string) (*config, error) {
 		return nil, fmt.Errorf("known_hosts and insecure_ignore_host_key cannot be used together")
 	}
 
-	knownHosts := values["known_hosts"]
-	if !insecure && knownHosts == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("find home directory for known_hosts: %w", err)
-		}
-		knownHosts = filepath.Join(home, ".ssh", "known_hosts")
+	address := endpoint.Host
+	if endpoint.Port() == "" {
+		address = net.JoinHostPort(endpoint.Hostname(), "22")
 	}
-
-	agentSocket, agentConfigured := values["ssh_auth_sock"]
-	if !agentConfigured && values["password"] == "" && values["private_key"] == "" {
-		agentSocket = os.Getenv("SSH_AUTH_SOCK")
-	}
-
-	cfg := &config{
-		address:              address,
-		user:                 username,
-		password:             values["password"],
-		privateKey:           values["private_key"],
-		privateKeyPassphrase: values["private_key_passphrase"],
-		agentSocket:          agentSocket,
-		knownHosts:           knownHosts,
-		insecureHostKey:      insecure,
-		root:                 defaultRoot,
-		targets:              append([]string(nil), defaultTargets...),
-	}
-	if cfg.password == "" && cfg.privateKey == "" && cfg.agentSocket == "" {
-		return nil, fmt.Errorf("configure password, private_key, or ssh_auth_sock")
-	}
-	return cfg, nil
+	return &config{
+		address:         address,
+		host:            endpoint.Hostname(),
+		port:            endpoint.Port(),
+		user:            username,
+		privateKey:      values["private_key"],
+		agentSocket:     values["ssh_auth_sock"],
+		knownHosts:      values["known_hosts"],
+		insecureHostKey: insecure,
+		root:            defaultRoot,
+		targets:         append([]string(nil), defaultTargets...),
+	}, nil
 }
 
 func parseBool(values map[string]string, name string) (bool, error) {
@@ -224,161 +244,90 @@ func expandPath(name string) (string, error) {
 	return name, nil
 }
 
-func authMethods(cfg *config) ([]ssh.AuthMethod, io.Closer, error) {
-	var signers []ssh.Signer
-	if cfg.privateKey != "" {
-		keyPath, err := expandPath(cfg.privateKey)
-		if err != nil {
-			return nil, nil, fmt.Errorf("expand private key path: %w", err)
-		}
-		keyData, err := os.ReadFile(keyPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read private key %q: %w", keyPath, err)
-		}
-		var signer ssh.Signer
-		if cfg.privateKeyPassphrase != "" {
-			signer, err = ssh.ParsePrivateKeyWithPassphrase(keyData, []byte(cfg.privateKeyPassphrase))
-		} else {
-			signer, err = ssh.ParsePrivateKey(keyData)
-		}
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse private key %q: %w", keyPath, err)
-		}
-		signers = append(signers, signer)
+func sshArgs(cfg *config) ([]string, error) {
+	args := []string{
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=2",
 	}
-
-	var agentConn net.Conn
-	var agentClient agent.ExtendedAgent
-	if cfg.agentSocket != "" {
-		conn, err := net.DialTimeout("unix", cfg.agentSocket, 10*time.Second)
-		if err != nil {
-			return nil, nil, fmt.Errorf("connect to SSH agent: %w", err)
-		}
-		agentConn = conn
-		agentClient = agent.NewClient(conn)
-	}
-
-	var methods []ssh.AuthMethod
-	if len(signers) > 0 || agentClient != nil {
-		methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-			available := append([]ssh.Signer(nil), signers...)
-			if agentClient != nil {
-				agentSigners, err := agentClient.Signers()
-				if err != nil {
-					return nil, err
-				}
-				available = append(available, agentSigners...)
-			}
-			return available, nil
-		}))
-	}
-	if cfg.password != "" {
-		methods = append(methods, ssh.Password(cfg.password))
-	}
-	if len(methods) == 0 {
-		return nil, agentConn, fmt.Errorf("no SSH authentication method available")
-	}
-	return methods, agentConn, nil
-}
-
-func hostKeyCallback(cfg *config) (ssh.HostKeyCallback, error) {
 	if cfg.insecureHostKey {
-		return ssh.InsecureIgnoreHostKey(), nil
-	}
-	knownHostsPath, err := expandPath(cfg.knownHosts)
-	if err != nil {
-		return nil, fmt.Errorf("expand known_hosts path: %w", err)
-	}
-	callback, err := knownhosts.New(knownHostsPath)
-	if err != nil {
-		return nil, fmt.Errorf("load known_hosts %q: %w", knownHostsPath, err)
-	}
-	return callback, nil
-}
-
-func connect(ctx context.Context, cfg *config) (remoteClient, *ssh.Client, io.Closer, error) {
-	auth, agentCloser, err := authMethods(cfg)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	closeAgent := func() {
-		if agentCloser != nil {
-			_ = agentCloser.Close()
+		args = append(args,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+		)
+	} else if cfg.knownHosts != "" {
+		knownHosts, err := expandPath(cfg.knownHosts)
+		if err != nil {
+			return nil, fmt.Errorf("expand known_hosts path: %w", err)
 		}
+		args = append(args, "-o", "UserKnownHostsFile="+knownHosts)
 	}
-
-	hostKey, err := hostKeyCallback(cfg)
-	if err != nil {
-		closeAgent()
-		return nil, nil, nil, err
+	if cfg.privateKey != "" {
+		privateKey, err := expandPath(cfg.privateKey)
+		if err != nil {
+			return nil, fmt.Errorf("expand private key path: %w", err)
+		}
+		args = append(args, "-i", privateKey)
 	}
-	algorithms := append([]string(nil), ssh.SupportedAlgorithms().HostKeys...)
-	// reMarkable 1 ships an older Dropbear that may only offer an ssh-rsa host key.
-	algorithms = append(algorithms, ssh.KeyAlgoRSA)
-	clientConfig := &ssh.ClientConfig{
-		User:              cfg.user,
-		Auth:              auth,
-		HostKeyCallback:   hostKey,
-		HostKeyAlgorithms: algorithms,
+	if cfg.user != "" {
+		args = append(args, "-l", cfg.user)
 	}
-
-	netConn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", cfg.address)
-	if err != nil {
-		closeAgent()
-		return nil, nil, nil, fmt.Errorf("connect to %s: %w", cfg.address, err)
+	if cfg.port != "" {
+		args = append(args, "-p", cfg.port)
 	}
-	stopHandshakeWatch := watchConnection(ctx, netConn, 10*time.Second)
-	conn, channels, requests, err := ssh.NewClientConn(netConn, cfg.address, clientConfig)
-	if err != nil {
-		stopHandshakeWatch()
-		_ = netConn.Close()
-		closeAgent()
-		return nil, nil, nil, fmt.Errorf("SSH handshake with %s: %w", cfg.address, err)
-	}
-	sshClient := ssh.NewClient(conn, channels, requests)
-	sftpClient, err := sftp.NewClient(sshClient)
-	stopHandshakeWatch()
-	if err != nil {
-		_ = sshClient.Close()
-		closeAgent()
-		return nil, nil, nil, fmt.Errorf("start SFTP subsystem: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		_ = sftpClient.Close()
-		_ = sshClient.Close()
-		closeAgent()
-		return nil, nil, nil, err
-	}
-	return &sftpRemote{Client: sftpClient}, sshClient, agentCloser, nil
+	return append(args, cfg.host, "-s", "sftp"), nil
 }
 
-func watchConnection(ctx context.Context, conn net.Conn, timeout time.Duration) func() {
-	deadline := time.Now().Add(timeout)
-	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
+func connect(ctx context.Context, cfg *config) (remoteClient, error) {
+	args, err := sshArgs(cfg)
+	if err != nil {
+		return nil, err
 	}
-	_ = conn.SetDeadline(deadline)
+	cmd := exec.Command("ssh", args...)
+	if cfg.agentSocket != "" {
+		cmd.Env = append(cmd.Environ(), "SSH_AUTH_SOCK="+cfg.agentSocket)
+	}
+	stderr := &lockedBuffer{}
+	cmd.Stderr = stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("SSH stdout: %w", err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("SSH stdin: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start SSH: %w", err)
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
 
-	done := make(chan struct{})
-	var once sync.Once
+	startupDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			select {
-			case <-done:
-				return
-			default:
-				_ = conn.SetDeadline(time.Now())
-			}
-		case <-done:
+			_ = cmd.Process.Kill()
+		case <-time.After(15 * time.Second):
+			_ = cmd.Process.Kill()
+		case <-startupDone:
 		}
 	}()
-	return func() {
-		once.Do(func() {
-			close(done)
-			_ = conn.SetDeadline(time.Time{})
-		})
+	sftpClient, err := sftp.NewClientPipe(stdout, stdin)
+	close(startupDone)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		processErr := <-wait
+		return nil, fmt.Errorf("start SFTP subsystem: %w (SSH: %v): %s", err, processErr, strings.TrimSpace(stderr.String()))
 	}
+	if err := ctx.Err(); err != nil {
+		_ = sftpClient.Close()
+		_ = cmd.Process.Kill()
+		<-wait
+		return nil, err
+	}
+	return &commandRemote{Client: sftpClient, cmd: cmd, wait: wait, stderr: stderr}, nil
 }
 
 func (r *Remarkable) Root() string          { return r.root }
@@ -553,17 +502,9 @@ func (r *Remarkable) watchCancellation(ctx context.Context) func() {
 
 func (r *Remarkable) closeTransport() error {
 	r.closeOnce.Do(func() {
-		var errs []error
-		if r.sshClient != nil {
-			errs = append(errs, r.sshClient.Close())
-		}
 		if r.remote != nil {
-			errs = append(errs, r.remote.Close())
+			r.closeErr = r.remote.Close()
 		}
-		if r.agentCloser != nil {
-			errs = append(errs, r.agentCloser.Close())
-		}
-		r.closeErr = errors.Join(errs...)
 	})
 	return r.closeErr
 }

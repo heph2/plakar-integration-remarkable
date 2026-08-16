@@ -1,8 +1,9 @@
 # reMarkable integration
 
 This importer backs up a reMarkable tablet over SSH. It is designed for the
-reMarkable 1 and uses the tablet's SFTP subsystem. The backup run is read-only:
-it does not install software, stop services, or write to the device.
+reMarkable 1 and uses the tablet's SFTP subsystem through the system OpenSSH
+client. The backup run is read-only: it does not install software, stop
+services, or write to the device.
 
 The snapshot preserves the raw, proprietary Xochitl data needed for recovery:
 
@@ -49,8 +50,19 @@ sftp root@10.11.99.1
 
 ## Build and install
 
+The `ssh` executable must be available in `PATH`.
+
 ```sh
 make package install
+```
+
+Nix-wrapped Plakar installations may point their default data directory into
+the read-only Nix store. Install and run with a writable data directory:
+
+```sh
+PLAKAR_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/plakar"
+plakar -datadir "$PLAKAR_DATA" pkg add -u ./remarkable_v1.1.0_linux_amd64.ptar
+plakar -datadir "$PLAKAR_DATA" at /path/to/repository backup remarkable://10.11.99.1
 ```
 
 ## Back up
@@ -71,16 +83,9 @@ plakar at /path/to/repository backup \
   remarkable://10.11.99.1
 ```
 
-Password authentication is supported for initial testing:
-
-```sh
-plakar at /path/to/repository backup \
-  -o password='password-shown-on-tablet' \
-  remarkable://10.11.99.1
-```
-
-Avoid this form in automation because command-line secrets may be visible in
-shell history or process listings.
+The importer invokes OpenSSH with `BatchMode=yes`, so password prompts are not
+supported. Use an SSH agent, `private_key`, or an identity configured in
+`~/.ssh/config`. Host aliases and other OpenSSH settings are honored.
 
 ## Consistency
 
@@ -109,16 +114,13 @@ until the command completes.
 | --- | --- | --- |
 | `location` | required | `remarkable://[user@]host[:port]`; paths are intentionally rejected |
 | `username` | `root` | SSH user, unless present in the location |
-| `password` | none | Device SSH password |
-| `private_key` | none | OpenSSH private-key path |
-| `private_key_passphrase` | none | Passphrase for `private_key` |
-| `ssh_auth_sock` | `$SSH_AUTH_SOCK` when no key/password is set | SSH agent socket |
+| `private_key` | OpenSSH configuration | Identity file passed to `ssh -i` |
+| `ssh_auth_sock` | `$SSH_AUTH_SOCK` | SSH agent socket override |
 | `known_hosts` | `~/.ssh/known_hosts` | Pinned OpenSSH host keys |
 | `insecure_ignore_host_key` | `false` | Disable host verification; testing only |
 
-The importer enables legacy `ssh-rsa` host-key negotiation because older
-reMarkable 1 Dropbear versions may offer only that algorithm. Host-key pinning
-remains enabled by default.
+Host-key pinning remains enabled by default. Any legacy algorithm overrides
+needed by older firmware can be configured normally in `~/.ssh/config`.
 
 ## References
 

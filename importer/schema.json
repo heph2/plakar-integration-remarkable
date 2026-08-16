@@ -11,7 +11,7 @@
       "type": "string",
       "minLength": 1,
       "description": "reMarkable SSH location: remarkable://[root@]<host>[:<port>]",
-      "pattern": "^remarkable://([^/:@?#]+@)?(\\[[0-9A-Fa-f:]+\\]|[^/:@?#]+)(:[0-9]{1,5})?/?$"
+      "pattern": "^remarkable://([^/:@?#]+@)?(\\[[0-9A-Fa-f:]+\\]|[^/:@?#-][^/:@?#]*)(:[0-9]{1,5})?/?$"
     },
     "username": {
       "type": "string",
@@ -19,22 +19,10 @@
       "default": "root",
       "description": "SSH username; cannot be combined with user@host in location"
     },
-    "password": {
-      "type": "string",
-      "minLength": 1,
-      "writeOnly": true,
-      "description": "SSH password shown on the tablet; a dedicated SSH key is recommended"
-    },
     "private_key": {
       "type": "string",
       "minLength": 1,
-      "description": "Path to an OpenSSH private key"
-    },
-    "private_key_passphrase": {
-      "type": "string",
-      "minLength": 1,
-      "writeOnly": true,
-      "description": "Passphrase for private_key"
+      "description": "Identity file passed to the system OpenSSH client with -i"
     },
     "ssh_auth_sock": {
       "type": "string",

@@ -2,15 +2,13 @@ package remarkable
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path"
 	"regexp"
 	"sort"
@@ -20,8 +18,7 @@ import (
 	"time"
 
 	"github.com/PlakarKorp/kloset/connectors"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/knownhosts"
+	"github.com/pkg/sftp"
 )
 
 func TestSchemaLocationPatternMatchesRuntimePolicy(t *testing.T) {
@@ -53,6 +50,7 @@ func TestSchemaLocationPatternMatchesRuntimePolicy(t *testing.T) {
 		}
 	}
 	for _, location := range []string{
+		"remarkable://-F",
 		"remarkable://root:secret@10.11.99.1",
 		"remarkable://10.11.99.1?profile=other",
 		"remarkable://10.11.99.1/tmp",
@@ -96,11 +94,63 @@ func TestSchemaRequiredKeysAreDefinedInEachSubschema(t *testing.T) {
 	check(schema, "#")
 }
 
+func TestSystemSSHArgumentsHonorAliasesAndSecureDefaults(t *testing.T) {
+	cfg, err := parseConfig(map[string]string{
+		"location": "remarkable://remarkable",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := sshArgs(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(args, " ")
+	for _, required := range []string{
+		"-o BatchMode=yes",
+		"-o ConnectTimeout=10",
+		"-l root",
+		"remarkable -s sftp",
+	} {
+		if !strings.Contains(got, required) {
+			t.Errorf("SSH arguments %q do not contain %q", got, required)
+		}
+	}
+	if strings.Contains(got, " -p ") {
+		t.Fatalf("default port should be left to OpenSSH config: %q", got)
+	}
+}
+
+func TestSystemSSHArgumentsApplyExplicitSecurityOptions(t *testing.T) {
+	cfg, err := parseConfig(map[string]string{
+		"location":      "remarkable://root@10.11.99.1:2222",
+		"private_key":   "~/id_remarkable",
+		"known_hosts":   "~/known_remarkable",
+		"ssh_auth_sock": "/tmp/remarkable-agent.sock",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := sshArgs(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(args, " ")
+	for _, required := range []string{
+		"-p 2222",
+		"-i ",
+		"-o UserKnownHostsFile=",
+		"10.11.99.1 -s sftp",
+	} {
+		if !strings.Contains(got, required) {
+			t.Errorf("SSH arguments %q do not contain %q", got, required)
+		}
+	}
+}
+
 func TestParseConfigDefaultsForRemarkableOne(t *testing.T) {
 	cfg, err := parseConfig(map[string]string{
-		"location":                 "remarkable://10.11.99.1",
-		"password":                 "device-password",
-		"insecure_ignore_host_key": "true",
+		"location": "remarkable://10.11.99.1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -128,14 +178,15 @@ func TestParseConfigRejectsUnsafeOrAmbiguousLocations(t *testing.T) {
 		name   string
 		config map[string]string
 	}{
-		{"missing host", map[string]string{"location": "remarkable://", "password": "x", "insecure_ignore_host_key": "true"}},
-		{"wrong scheme", map[string]string{"location": "ssh://10.11.99.1", "password": "x", "insecure_ignore_host_key": "true"}},
-		{"custom path", map[string]string{"location": "remarkable://10.11.99.1/tmp", "password": "x", "insecure_ignore_host_key": "true"}},
-		{"password in URI", map[string]string{"location": "remarkable://root:secret@10.11.99.1", "insecure_ignore_host_key": "true"}},
-		{"two usernames", map[string]string{"location": "remarkable://root@10.11.99.1", "username": "root", "password": "x", "insecure_ignore_host_key": "true"}},
-		{"no authentication", map[string]string{"location": "remarkable://10.11.99.1", "insecure_ignore_host_key": "true", "ssh_auth_sock": ""}},
-		{"invalid boolean", map[string]string{"location": "remarkable://10.11.99.1", "password": "x", "insecure_ignore_host_key": "sometimes"}},
-		{"conflicting host policy", map[string]string{"location": "remarkable://10.11.99.1", "password": "x", "known_hosts": "/tmp/known_hosts", "insecure_ignore_host_key": "true"}},
+		{"missing host", map[string]string{"location": "remarkable://"}},
+		{"option-like host", map[string]string{"location": "remarkable://-F"}},
+		{"wrong scheme", map[string]string{"location": "ssh://10.11.99.1"}},
+		{"custom path", map[string]string{"location": "remarkable://10.11.99.1/tmp"}},
+		{"password in URI", map[string]string{"location": "remarkable://root:secret@10.11.99.1"}},
+		{"password option", map[string]string{"location": "remarkable://10.11.99.1", "password": "secret"}},
+		{"two usernames", map[string]string{"location": "remarkable://root@10.11.99.1", "username": "root"}},
+		{"invalid boolean", map[string]string{"location": "remarkable://10.11.99.1", "insecure_ignore_host_key": "sometimes"}},
+		{"conflicting host policy", map[string]string{"location": "remarkable://10.11.99.1", "known_hosts": "/tmp/known_hosts", "insecure_ignore_host_key": "true"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -143,98 +194,6 @@ func TestParseConfigRejectsUnsafeOrAmbiguousLocations(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
-	}
-}
-
-func TestExplicitPasswordIgnoresAnAmbientBrokenAgent(t *testing.T) {
-	t.Setenv("SSH_AUTH_SOCK", path.Join(t.TempDir(), "missing-agent.sock"))
-	cfg, err := parseConfig(map[string]string{
-		"location":                 "remarkable://10.11.99.1",
-		"password":                 "device-password",
-		"insecure_ignore_host_key": "true",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.agentSocket != "" {
-		t.Fatalf("ambient agent was selected despite explicit authentication: %q", cfg.agentSocket)
-	}
-	methods, closer, err := authMethods(cfg)
-	if closer != nil {
-		defer closer.Close()
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(methods) != 1 {
-		t.Fatalf("got %d methods, want password only", len(methods))
-	}
-}
-
-func TestPrivateKeyUsesItsOwnPassphrase(t *testing.T) {
-	_, key, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	block, err := ssh.MarshalPrivateKeyWithPassphrase(key, "remarkable test key", []byte("key-passphrase"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyFile := path.Join(t.TempDir(), "id_remarkable")
-	if err := os.WriteFile(keyFile, pem.EncodeToMemory(block), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &config{
-		password:             "device-password",
-		privateKey:           keyFile,
-		privateKeyPassphrase: "key-passphrase",
-	}
-	methods, closer, err := authMethods(cfg)
-	if closer != nil {
-		defer closer.Close()
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(methods) != 2 {
-		t.Fatalf("got %d auth methods, want password and private key", len(methods))
-	}
-}
-
-func TestKnownHostsPinsTheTabletKey(t *testing.T) {
-	pub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostKey, err := ssh.NewPublicKey(pub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	knownHosts := path.Join(t.TempDir(), "known_hosts")
-	line := knownhosts.Line([]string{"10.11.99.1"}, hostKey) + "\n"
-	if err := os.WriteFile(knownHosts, []byte(line), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	callback, err := hostKeyCallback(&config{knownHosts: knownHosts})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := callback("10.11.99.1:22", &net.TCPAddr{IP: net.ParseIP("10.11.99.1"), Port: 22}, hostKey); err != nil {
-		t.Fatalf("pinned key rejected: %v", err)
-	}
-
-	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherKey, err := ssh.NewPublicKey(otherPub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := callback("10.11.99.1:22", &net.TCPAddr{IP: net.ParseIP("10.11.99.1"), Port: 22}, otherKey); err == nil {
-		t.Fatal("changed host key was accepted")
 	}
 }
 
@@ -452,41 +411,64 @@ func TestImportCancellationInterruptsBlockedRemoteIO(t *testing.T) {
 	}
 }
 
-func TestConnectCancellationInterruptsSSHHandshake(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+func TestSSHHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_REMARKABLE_SSH_HELPER") != "1" {
+		return
+	}
+	_, _ = os.Stdout.Write([]byte{0, 0, 0, 5, 2, 0, 0, 0, 3})
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	time.Sleep(30 * time.Second)
+}
+
+func TestCommandRemoteCloseKillsHungSSHProcess(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestSSHHelperProcess")
+	cmd.Env = append(cmd.Environ(), "GO_WANT_REMARKABLE_SSH_HELPER=1")
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
-	peerClosed := make(chan struct{})
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			close(peerClosed)
-			return
-		}
-		defer conn.Close()
-		select {
-		case <-peerClosed:
-		case <-time.After(time.Second):
-		}
-	}()
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	client, err := sftp.NewClientPipe(stdout, stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &commandRemote{Client: client, cmd: cmd, wait: wait, stderr: &lockedBuffer{}}
+	done := make(chan error, 1)
+	go func() { done <- remote.Close() }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatal("Close did not kill a hung SSH process")
+	}
+}
+
+func TestConnectCancellationStopsSystemSSH(t *testing.T) {
+	binDir := t.TempDir()
+	sshPath := path.Join(binDir, "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh\nexec sleep 10\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	_, _, _, err = connect(ctx, &config{
-		address:         listener.Addr().String(),
-		user:            "root",
-		password:        "password",
-		insecureHostKey: true,
-	})
-	close(peerClosed)
+	_, err := connect(ctx, &config{host: "remarkable", user: "root"})
 	if err == nil {
-		t.Fatal("expected handshake cancellation error")
+		t.Fatal("expected system SSH cancellation error")
 	}
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("handshake cancellation took %s", elapsed)
+		t.Fatalf("system SSH cancellation took %s", elapsed)
 	}
 }
 
