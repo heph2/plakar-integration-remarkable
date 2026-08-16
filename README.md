@@ -112,7 +112,7 @@ until the command completes.
 | `password` | none | Device SSH password |
 | `private_key` | none | OpenSSH private-key path |
 | `private_key_passphrase` | none | Passphrase for `private_key` |
-| `ssh_auth_sock` | `$SSH_AUTH_SOCK` | SSH agent socket |
+| `ssh_auth_sock` | `$SSH_AUTH_SOCK` when no key/password is set | SSH agent socket |
 | `known_hosts` | `~/.ssh/known_hosts` | Pinned OpenSSH host keys |
 | `insecure_ignore_host_key` | `false` | Disable host verification; testing only |
 

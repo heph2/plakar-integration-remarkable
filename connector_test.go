@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -60,6 +61,39 @@ func TestSchemaLocationPatternMatchesRuntimePolicy(t *testing.T) {
 			t.Errorf("invalid location accepted: %s", location)
 		}
 	}
+}
+
+func TestSchemaRequiredKeysAreDefinedInEachSubschema(t *testing.T) {
+	data, err := os.ReadFile("importer/schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema any
+	if err := json.Unmarshal(data, &schema); err != nil {
+		t.Fatal(err)
+	}
+	var check func(any, string)
+	check = func(value any, location string) {
+		switch value := value.(type) {
+		case map[string]any:
+			if required, ok := value["required"].([]any); ok {
+				properties, _ := value["properties"].(map[string]any)
+				for _, key := range required {
+					if _, ok := properties[key.(string)]; !ok {
+						t.Errorf("%s: required key %q is not locally defined", location, key)
+					}
+				}
+			}
+			for key, child := range value {
+				check(child, location+"/"+key)
+			}
+		case []any:
+			for index, child := range value {
+				check(child, fmt.Sprintf("%s/%d", location, index))
+			}
+		}
+	}
+	check(schema, "#")
 }
 
 func TestParseConfigDefaultsForRemarkableOne(t *testing.T) {

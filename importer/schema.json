@@ -68,6 +68,11 @@
       },
       "then": {
         "not": {
+          "properties": {
+            "username": {
+              "type": "string"
+            }
+          },
           "required": [
             "username"
           ]
@@ -88,6 +93,11 @@
       },
       "then": {
         "not": {
+          "properties": {
+            "known_hosts": {
+              "type": "string"
+            }
+          },
           "required": [
             "known_hosts"
           ]
