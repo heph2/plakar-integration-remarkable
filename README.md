@@ -61,7 +61,7 @@ the read-only Nix store. Install and run with a writable data directory:
 
 ```sh
 PLAKAR_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/plakar"
-plakar -datadir "$PLAKAR_DATA" pkg add -u ./remarkable_v1.1.0_linux_amd64.ptar
+plakar -datadir "$PLAKAR_DATA" pkg add -u ./remarkable_v1.1.1_linux_amd64.ptar
 plakar -datadir "$PLAKAR_DATA" at /path/to/repository backup remarkable://10.11.99.1
 ```
 
