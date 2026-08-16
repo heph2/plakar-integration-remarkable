@@ -1,8 +1,8 @@
 # reMarkable integration
 
-This importer backs up a reMarkable tablet over SSH. It is designed and tested
-around the reMarkable 1 and uses the tablet's SFTP subsystem without installing
-software or writing to the device.
+This importer backs up a reMarkable tablet over SSH. It is designed for the
+reMarkable 1 and uses the tablet's SFTP subsystem. The backup run is read-only:
+it does not install software, stop services, or write to the device.
 
 The snapshot preserves the raw, proprietary Xochitl data needed for recovery:
 
@@ -33,7 +33,9 @@ ssh-add ~/.ssh/id_rsa_remarkable
 ```
 
 The explicit installation commands avoid an `ssh-copy-id` path bug present in
-OpenSSH versions older than 9.4 when used with Dropbear.
+OpenSSH versions older than 9.4 when used with Dropbear. Installing the public
+key is an explicit one-time device change, and possession of the private key
+grants root access to the tablet; store it accordingly.
 
 Pin the host key while directly connected over a trusted USB cable. Review the
 fingerprint before accepting it; do not use `insecure_ignore_host_key` for
@@ -89,9 +91,12 @@ in a separate SSH session immediately before the backup and always start it
 again afterward:
 
 ```sh
-ssh root@10.11.99.1 'systemctl stop xochitl'
-plakar at /path/to/repository backup remarkable://10.11.99.1
-ssh root@10.11.99.1 'systemctl start xochitl'
+(
+  set -e
+  trap "ssh root@10.11.99.1 'systemctl start xochitl'" EXIT
+  ssh root@10.11.99.1 'systemctl stop xochitl'
+  plakar at /path/to/repository backup remarkable://10.11.99.1
+)
 ```
 
 A backup taken while Xochitl is running is best-effort and may combine files

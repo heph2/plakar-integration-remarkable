@@ -11,7 +11,7 @@
       "type": "string",
       "minLength": 1,
       "description": "reMarkable SSH location: remarkable://[root@]<host>[:<port>]",
-      "pattern": "^remarkable://[^/]+/?$"
+      "pattern": "^remarkable://([^/:@?#]+@)?(\\[[0-9A-Fa-f:]+\\]|[^/:@?#]+)(:[0-9]{1,5})?/?$"
     },
     "username": {
       "type": "string",
@@ -58,7 +58,8 @@
       "if": {
         "properties": {
           "location": {
-            "pattern": "^remarkable://[^/@]+@"
+            "type": "string",
+            "pattern": "^remarkable://[^/:@?#]+@"
           }
         },
         "required": [
@@ -80,6 +81,7 @@
         ],
         "properties": {
           "insecure_ignore_host_key": {
+            "type": "boolean",
             "const": true
           }
         }

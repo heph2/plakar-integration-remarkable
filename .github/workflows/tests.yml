@@ -2,7 +2,13 @@ name: tests
 
 on:
   push:
+    paths:
+      - remarkable/**
+      - .github/workflows/tests.yml
   pull_request:
+    paths:
+      - remarkable/**
+      - .github/workflows/tests.yml
 
 permissions:
   contents: read
@@ -19,6 +25,8 @@ jobs:
         with:
           go-version-file: remarkable/go.mod
           cache-dependency-path: remarkable/go.sum
-      - run: go test ./...
+      - run: python3 -m json.tool importer/schema.json >/dev/null
+      - run: go mod verify
+      - run: go test -race ./...
       - run: go vet ./...
       - run: go build ./...
