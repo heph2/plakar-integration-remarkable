@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PlakarKorp/kloset/connectors"
@@ -78,6 +79,8 @@ type Remarkable struct {
 
 	sshClient   *ssh.Client
 	agentCloser io.Closer
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 func init() {
@@ -106,7 +109,9 @@ func NewImporter(ctx context.Context, opts *connectors.Options, proto string, va
 		sshClient:   sshClient,
 		agentCloser: agentCloser,
 	}
-	if err := imp.Ping(ctx); err != nil {
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := imp.Ping(pingCtx); err != nil {
 		_ = imp.Close(ctx)
 		return nil, err
 	}
@@ -171,7 +176,7 @@ func parseConfig(values map[string]string) (*config, error) {
 	}
 
 	agentSocket, agentConfigured := values["ssh_auth_sock"]
-	if !agentConfigured {
+	if !agentConfigured && values["password"] == "" && values["private_key"] == "" {
 		agentSocket = os.Getenv("SSH_AUTH_SOCK")
 	}
 
@@ -220,7 +225,7 @@ func expandPath(name string) (string, error) {
 }
 
 func authMethods(cfg *config) ([]ssh.AuthMethod, io.Closer, error) {
-	var methods []ssh.AuthMethod
+	var signers []ssh.Signer
 	if cfg.privateKey != "" {
 		keyPath, err := expandPath(cfg.privateKey)
 		if err != nil {
@@ -239,17 +244,33 @@ func authMethods(cfg *config) ([]ssh.AuthMethod, io.Closer, error) {
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse private key %q: %w", keyPath, err)
 		}
-		methods = append(methods, ssh.PublicKeys(signer))
+		signers = append(signers, signer)
 	}
 
 	var agentConn net.Conn
+	var agentClient agent.ExtendedAgent
 	if cfg.agentSocket != "" {
 		conn, err := net.DialTimeout("unix", cfg.agentSocket, 10*time.Second)
 		if err != nil {
 			return nil, nil, fmt.Errorf("connect to SSH agent: %w", err)
 		}
 		agentConn = conn
-		methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
+		agentClient = agent.NewClient(conn)
+	}
+
+	var methods []ssh.AuthMethod
+	if len(signers) > 0 || agentClient != nil {
+		methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+			available := append([]ssh.Signer(nil), signers...)
+			if agentClient != nil {
+				agentSigners, err := agentClient.Signers()
+				if err != nil {
+					return nil, err
+				}
+				available = append(available, agentSigners...)
+			}
+			return available, nil
+		}))
 	}
 	if cfg.password != "" {
 		methods = append(methods, ssh.Password(cfg.password))
@@ -299,7 +320,6 @@ func connect(ctx context.Context, cfg *config) (remoteClient, *ssh.Client, io.Cl
 		Auth:              auth,
 		HostKeyCallback:   hostKey,
 		HostKeyAlgorithms: algorithms,
-		Timeout:           10 * time.Second,
 	}
 
 	netConn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", cfg.address)
@@ -307,20 +327,58 @@ func connect(ctx context.Context, cfg *config) (remoteClient, *ssh.Client, io.Cl
 		closeAgent()
 		return nil, nil, nil, fmt.Errorf("connect to %s: %w", cfg.address, err)
 	}
+	stopHandshakeWatch := watchConnection(ctx, netConn, 10*time.Second)
 	conn, channels, requests, err := ssh.NewClientConn(netConn, cfg.address, clientConfig)
 	if err != nil {
+		stopHandshakeWatch()
 		_ = netConn.Close()
 		closeAgent()
 		return nil, nil, nil, fmt.Errorf("SSH handshake with %s: %w", cfg.address, err)
 	}
 	sshClient := ssh.NewClient(conn, channels, requests)
 	sftpClient, err := sftp.NewClient(sshClient)
+	stopHandshakeWatch()
 	if err != nil {
 		_ = sshClient.Close()
 		closeAgent()
 		return nil, nil, nil, fmt.Errorf("start SFTP subsystem: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		_ = sftpClient.Close()
+		_ = sshClient.Close()
+		closeAgent()
+		return nil, nil, nil, err
+	}
 	return &sftpRemote{Client: sftpClient}, sshClient, agentCloser, nil
+}
+
+func watchConnection(ctx context.Context, conn net.Conn, timeout time.Duration) func() {
+	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			select {
+			case <-done:
+				return
+			default:
+				_ = conn.SetDeadline(time.Now())
+			}
+		case <-done:
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(done)
+			_ = conn.SetDeadline(time.Time{})
+		})
+	}
 }
 
 func (r *Remarkable) Root() string          { return r.root }
@@ -329,6 +387,8 @@ func (r *Remarkable) Type() string          { return "remarkable" }
 func (r *Remarkable) Flags() location.Flags { return 0 }
 
 func (r *Remarkable) Ping(ctx context.Context) error {
+	stop := r.watchCancellation(ctx)
+	defer stop()
 	for _, target := range r.targets {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -342,6 +402,8 @@ func (r *Remarkable) Ping(ctx context.Context) error {
 
 func (r *Remarkable) Import(ctx context.Context, records chan<- *connectors.Record, results <-chan *connectors.Result) error {
 	defer close(records)
+	stop := r.watchCancellation(ctx)
+	defer stop()
 
 	for _, pathname := range defaultPrefixes {
 		if err := r.emit(ctx, records, pathname, nil); err != nil {
@@ -364,18 +426,27 @@ func (r *Remarkable) walk(ctx context.Context, records chan<- *connectors.Record
 		var err error
 		info, err = r.remote.Lstat(pathname)
 		if err != nil {
-			return fmt.Errorf("lstat %q: %w", pathname, err)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return r.reportError(ctx, records, pathname, fmt.Errorf("lstat %q: %w", pathname, err))
 		}
 	}
 	if err := r.emit(ctx, records, pathname, info); err != nil {
-		return err
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return r.reportError(ctx, records, pathname, err)
 	}
 	if !info.IsDir() {
 		return nil
 	}
 	entries, err := r.remote.ReadDir(pathname)
 	if err != nil {
-		return fmt.Errorf("read directory %q: %w", pathname, err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return r.reportError(ctx, records, pathname, fmt.Errorf("read directory %q: %w", pathname, err))
 	}
 	for _, entry := range entries {
 		if err := r.walk(ctx, records, path.Join(pathname, entry.Name()), entry); err != nil {
@@ -416,17 +487,25 @@ func (r *Remarkable) emit(ctx context.Context, records chan<- *connectors.Record
 		}
 	}
 
-	var open func() (io.ReadCloser, error)
+	record := &connectors.Record{
+		Pathname: pathname,
+		Target:   target,
+		FileInfo: fileInfo,
+	}
 	if info.Mode().IsRegular() {
-		open = func() (io.ReadCloser, error) {
+		record = connectors.NewRecord(pathname, target, fileInfo, nil, func() (io.ReadCloser, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			stop := r.watchCancellation(ctx)
 			reader, err := r.remote.Open(pathname)
 			if err != nil {
+				stop()
 				return nil, fmt.Errorf("open %q: %w", pathname, err)
 			}
-			return reader, nil
-		}
+			return &watchedReader{ReadCloser: reader, stop: stop}, nil
+		})
 	}
-	record := connectors.NewRecord(pathname, target, fileInfo, nil, open)
 	select {
 	case records <- record:
 		return nil
@@ -435,16 +514,60 @@ func (r *Remarkable) emit(ctx context.Context, records chan<- *connectors.Record
 	}
 }
 
+func (r *Remarkable) reportError(ctx context.Context, records chan<- *connectors.Record, pathname string, err error) error {
+	select {
+	case records <- connectors.NewError(pathname, err):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type watchedReader struct {
+	io.ReadCloser
+	stop func()
+}
+
+func (r *watchedReader) Close() error {
+	r.stop()
+	return r.ReadCloser.Close()
+}
+
+func (r *Remarkable) watchCancellation(ctx context.Context) func() {
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			select {
+			case <-done:
+				return
+			default:
+				_ = r.closeTransport()
+			}
+		case <-done:
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
+}
+
+func (r *Remarkable) closeTransport() error {
+	r.closeOnce.Do(func() {
+		var errs []error
+		if r.sshClient != nil {
+			errs = append(errs, r.sshClient.Close())
+		}
+		if r.remote != nil {
+			errs = append(errs, r.remote.Close())
+		}
+		if r.agentCloser != nil {
+			errs = append(errs, r.agentCloser.Close())
+		}
+		r.closeErr = errors.Join(errs...)
+	})
+	return r.closeErr
+}
+
 func (r *Remarkable) Close(ctx context.Context) error {
-	var errs []error
-	if r.remote != nil {
-		errs = append(errs, r.remote.Close())
-	}
-	if r.sshClient != nil {
-		errs = append(errs, r.sshClient.Close())
-	}
-	if r.agentCloser != nil {
-		errs = append(errs, r.agentCloser.Close())
-	}
-	return errors.Join(errs...)
+	return r.closeTransport()
 }

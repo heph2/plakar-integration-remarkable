@@ -4,13 +4,17 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +22,45 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
+
+func TestSchemaLocationPatternMatchesRuntimePolicy(t *testing.T) {
+	data, err := os.ReadFile("importer/schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Properties struct {
+			Location struct {
+				Pattern string `json:"pattern"`
+			} `json:"location"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(data, &schema); err != nil {
+		t.Fatal(err)
+	}
+	pattern, err := regexp.Compile(schema.Properties.Location.Pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, location := range []string{
+		"remarkable://10.11.99.1",
+		"remarkable://root@remarkable.local:22",
+		"remarkable://root@[fe80::1]:22",
+	} {
+		if !pattern.MatchString(location) {
+			t.Errorf("valid location rejected: %s", location)
+		}
+	}
+	for _, location := range []string{
+		"remarkable://root:secret@10.11.99.1",
+		"remarkable://10.11.99.1?profile=other",
+		"remarkable://10.11.99.1/tmp",
+	} {
+		if pattern.MatchString(location) {
+			t.Errorf("invalid location accepted: %s", location)
+		}
+	}
+}
 
 func TestParseConfigDefaultsForRemarkableOne(t *testing.T) {
 	cfg, err := parseConfig(map[string]string{
@@ -66,6 +109,31 @@ func TestParseConfigRejectsUnsafeOrAmbiguousLocations(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
+	}
+}
+
+func TestExplicitPasswordIgnoresAnAmbientBrokenAgent(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", path.Join(t.TempDir(), "missing-agent.sock"))
+	cfg, err := parseConfig(map[string]string{
+		"location":                 "remarkable://10.11.99.1",
+		"password":                 "device-password",
+		"insecure_ignore_host_key": "true",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.agentSocket != "" {
+		t.Fatalf("ambient agent was selected despite explicit authentication: %q", cfg.agentSocket)
+	}
+	methods, closer, err := authMethods(cfg)
+	if closer != nil {
+		defer closer.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(methods) != 1 {
+		t.Fatalf("got %d methods, want password only", len(methods))
 	}
 }
 
@@ -143,8 +211,9 @@ type fakeNode struct {
 }
 
 type fakeRemote struct {
-	nodes  map[string]fakeNode
-	closed bool
+	nodes         map[string]fakeNode
+	readDirErrors map[string]error
+	closed        bool
 }
 
 func (f *fakeRemote) Lstat(name string) (os.FileInfo, error) {
@@ -156,6 +225,9 @@ func (f *fakeRemote) Lstat(name string) (os.FileInfo, error) {
 }
 
 func (f *fakeRemote) ReadDir(name string) ([]os.FileInfo, error) {
+	if err := f.readDirErrors[name]; err != nil {
+		return nil, err
+	}
 	if node, ok := f.nodes[name]; !ok || !node.mode.IsDir() {
 		return nil, os.ErrNotExist
 	}
@@ -236,6 +308,9 @@ func TestImportBacksUpRawDocumentsAndSensitiveConfiguration(t *testing.T) {
 		if record.Err != nil {
 			t.Fatalf("record %s: %v", record.Pathname, record.Err)
 		}
+		if !record.FileInfo.Lmode.IsRegular() && record.Reader != nil {
+			t.Fatalf("non-regular record %s has a content reader", record.Pathname)
+		}
 		if record.Pathname == "/home/root/.local/share/remarkable/xochitl/latest" {
 			symlinkTarget = record.Target
 		}
@@ -262,6 +337,122 @@ func TestImportBacksUpRawDocumentsAndSensitiveConfiguration(t *testing.T) {
 	}
 	if _, ok := got["/home/root/.local/share/remarkable/xochitl/document.metadata"]; !ok {
 		t.Fatal("metadata sidecar was not backed up")
+	}
+}
+
+func TestImportReportsOneDirectoryErrorAndContinues(t *testing.T) {
+	const dir = os.ModeDir | 0700
+	remote := &fakeRemote{
+		nodes: map[string]fakeNode{
+			"/home/root":                                 {mode: dir},
+			"/home/root/.config":                         {mode: dir},
+			"/home/root/.config/remarkable":              {mode: dir},
+			"/home/root/.config/remarkable/xochitl.conf": {mode: 0600, content: "config"},
+			"/home/root/.local":                          {mode: dir},
+			"/home/root/.local/share":                    {mode: dir},
+			"/home/root/.local/share/remarkable":         {mode: dir},
+			"/home/root/.local/share/remarkable/xochitl": {mode: dir},
+		},
+		readDirErrors: map[string]error{
+			"/home/root/.local/share/remarkable/xochitl": errors.New("document changed during backup"),
+		},
+	}
+	imp := &Remarkable{origin: "tablet:22", root: defaultRoot, targets: defaultTargets, remote: remote}
+	records := make(chan *connectors.Record, 32)
+	if err := imp.Import(context.Background(), records, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotError, gotConfig bool
+	for record := range records {
+		if record.Pathname == "/home/root/.local/share/remarkable/xochitl" && record.Err != nil {
+			gotError = true
+		}
+		if record.Pathname == "/home/root/.config/remarkable/xochitl.conf" && record.Err == nil {
+			gotConfig = true
+		}
+	}
+	if !gotError || !gotConfig {
+		t.Fatalf("error record = %v, config record = %v", gotError, gotConfig)
+	}
+}
+
+type blockingRemote struct {
+	started chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingRemote) Lstat(string) (os.FileInfo, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.closed
+	return nil, net.ErrClosed
+}
+func (r *blockingRemote) ReadDir(string) ([]os.FileInfo, error) { return nil, net.ErrClosed }
+func (r *blockingRemote) ReadLink(string) (string, error)       { return "", net.ErrClosed }
+func (r *blockingRemote) Open(string) (io.ReadCloser, error)    { return nil, net.ErrClosed }
+func (r *blockingRemote) Close() error {
+	select {
+	case <-r.closed:
+	default:
+		close(r.closed)
+	}
+	return nil
+}
+
+func TestImportCancellationInterruptsBlockedRemoteIO(t *testing.T) {
+	remote := &blockingRemote{started: make(chan struct{}), closed: make(chan struct{})}
+	imp := &Remarkable{root: defaultRoot, targets: defaultTargets, remote: remote}
+	ctx, cancel := context.WithCancel(context.Background())
+	records := make(chan *connectors.Record, 1)
+	done := make(chan error, 1)
+	go func() { done <- imp.Import(ctx, records, nil) }()
+	<-remote.started
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		remote.Close()
+		t.Fatal("Import did not interrupt blocked remote I/O after cancellation")
+	}
+}
+
+func TestConnectCancellationInterruptsSSHHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	peerClosed := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			close(peerClosed)
+			return
+		}
+		defer conn.Close()
+		select {
+		case <-peerClosed:
+		case <-time.After(time.Second):
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, _, err = connect(ctx, &config{
+		address:         listener.Addr().String(),
+		user:            "root",
+		password:        "password",
+		insecureHostKey: true,
+	})
+	close(peerClosed)
+	if err == nil {
+		t.Fatal("expected handshake cancellation error")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("handshake cancellation took %s", elapsed)
 	}
 }
 
