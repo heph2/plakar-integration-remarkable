@@ -1,4 +1,4 @@
-module github.com/PlakarKorp/integrations/remarkable
+module github.com/heph2/plakar-integration-remarkable
 
 go 1.26.4
 

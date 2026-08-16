@@ -4,7 +4,7 @@ import (
 	"os"
 
 	sdk "github.com/PlakarKorp/go-kloset-sdk"
-	"github.com/PlakarKorp/integrations/remarkable"
+	"github.com/heph2/plakar-integration-remarkable"
 )
 
 func main() {

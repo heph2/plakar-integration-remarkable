@@ -1,11 +1,11 @@
 name: remarkable
 display_name: reMarkable
 description: Back up reMarkable documents and configuration over SSH
-homepage: https://github.com/PlakarKorp/integrations/tree/main/remarkable
+homepage: https://github.com/heph2/plakar-integration-remarkable
 license: ISC
 api_version: v1.1.0
-tier: official
-contact: mailto:help@plakar.io
+tier: third-party
+contact: https://github.com/heph2/plakar-integration-remarkable/issues
 connectors:
   - type: importer
     executable: ./remarkable-importer
