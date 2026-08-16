@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Plakar reMarkable Importer Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "location"
+  ],
+  "properties": {
+    "location": {
+      "type": "string",
+      "minLength": 1,
+      "description": "reMarkable SSH location: remarkable://[root@]<host>[:<port>]",
+      "pattern": "^remarkable://[^/]+/?$"
+    },
+    "username": {
+      "type": "string",
+      "minLength": 1,
+      "default": "root",
+      "description": "SSH username; cannot be combined with user@host in location"
+    },
+    "password": {
+      "type": "string",
+      "minLength": 1,
+      "writeOnly": true,
+      "description": "SSH password shown on the tablet; a dedicated SSH key is recommended"
+    },
+    "private_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to an OpenSSH private key"
+    },
+    "private_key_passphrase": {
+      "type": "string",
+      "minLength": 1,
+      "writeOnly": true,
+      "description": "Passphrase for private_key"
+    },
+    "ssh_auth_sock": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to an SSH agent socket; defaults to SSH_AUTH_SOCK"
+    },
+    "known_hosts": {
+      "type": "string",
+      "minLength": 1,
+      "default": "~/.ssh/known_hosts",
+      "description": "OpenSSH known_hosts file used to pin the tablet host key"
+    },
+    "insecure_ignore_host_key": {
+      "type": "boolean",
+      "default": false,
+      "description": "Disable host-key verification (dangerous; intended only for testing)"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "location": {
+            "pattern": "^remarkable://[^/@]+@"
+          }
+        },
+        "required": [
+          "location"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "username"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "insecure_ignore_host_key"
+        ],
+        "properties": {
+          "insecure_ignore_host_key": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "known_hosts"
+          ]
+        }
+      }
+    }
+  ]
+}
