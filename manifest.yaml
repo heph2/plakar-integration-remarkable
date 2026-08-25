@@ -4,7 +4,7 @@ description: Back up reMarkable documents and configuration over SSH
 homepage: https://github.com/heph2/plakar-integration-remarkable
 license: ISC
 api_version: v1.1.0
-tier: third-party
+tier: community
 contact: https://github.com/heph2/plakar-integration-remarkable/issues
 connectors:
   - type: importer
