@@ -11,4 +11,4 @@ connectors:
     executable: ./remarkable-importer
     protocols: [remarkable]
     validator: ./importer/schema.json
-    class: source
+    class: file-storage
